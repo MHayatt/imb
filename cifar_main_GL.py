@@ -213,27 +213,89 @@ def main():
 
 
 ################################
-    model = nn.Sequential(*list(model.children())[:-1])
-    class Head_Net(nn.Module):
 
-        def __init__(self, in_features, mid_features, num_classes=10):
-            super(Head_Net, self).__init__()
-            self.fc1 = nn.Linear(in_features,num_classes)
+    import math
 
+    class GLayer(nn.Module):
+        def __init__(self, num_classes=10, feat_dim=2, use_gpu=True,scale=1):
+            super(GLayer, self).__init__()
+            self.centers = nn.Parameter(torch.Tensor(num_classes,feat_dim,))
+            self.reset_parameters()
+            self.sigma=10
+            self.scale=scale
+            self.bn=nn.BatchNorm1d(feat_dim)
+        def reset_parameters(self):
+            stdv = 1. / math.sqrt(self.centers.size(1))
+            self.centers.data.uniform_(-stdv, stdv)
+
+        def forward(self,x):
+            
+            
+            
+            # x = self.bn(x)
+            x_norm = (x**2).sum(1).view(-1, 1)
+            y=self.centers
+            y_t = torch.transpose(y, 0, 1)
+            y_norm = (y**2).sum(1).view(1, -1) 
+            dist = x_norm + y_norm - 2.0 * torch.mm(x, y_t)
+            dist = torch.clamp(dist, 0.0, 1e2)
+
+            # return 1.0/(1.0+dist)
+            sim= self.scale*torch.exp(- dist /self.sigma)
+            return sim 
+
+    class FullModel(nn.Module):
+        def __init__(self, base_model,g_layer,linear_layer):
+            super(FullModel, self).__init__()
+            self.base = base_model
+            # self.lin = linear_layer
+            self.gl = g_layer
         def forward(self, x):
-            x = x.view(x.size(0), -1)
-            x = self.fc1(x)
-            return x  
-        
-    HeadNet=Head_Net(342,args.feats_dim).cuda()
-    model=nn.Sequential(model,HeadNet)
+            x = self.base(x)
+            x = x.view(x.size(0),-1)
+            return self.gl(x)
+
+
+    base_model = nn.Sequential(*list(model.children())[:-1])
+
+    head=GLayer(num_classes=num_classes,feat_dim=342).cuda()
+    # model=nn.Sequential(model,HeadNet)
+    linear_layer=nn.Linear(342,num_classes).cuda()
+    model = FullModel(base_model,head,linear_layer)
+
+
 ################################
     model = torch.nn.DataParallel(model).cuda()
     cudnn.benchmark = True
     print('    Total params: %.2fM' % (sum(p.numel() for p in model.parameters())/1000000.0))
 
-    # criterion = nn.CrossEntropyLoss()
-    criterion_xent = nn.CrossEntropyLoss()
+ ################################
+    class HingeLossSim(nn.Module):
+        def __init__(self, num_classes=10,use_gpu=True,margin=1):
+            super(HingeLossSim, self).__init__()
+            self.num_classes = num_classes
+            self.use_gpu=use_gpu
+            self.margin=margin
+        def forward(self, x, labels):
+            batch_size=x.size(0)
+            classes = torch.arange(self.num_classes).long()
+            if self.use_gpu: classes = classes.cuda()
+            labels = labels.unsqueeze(1).expand(batch_size, self.num_classes)
+            mask = labels.eq(classes.expand(batch_size, self.num_classes))
+            neg=x[~mask].view(batch_size,-1)
+            pos=x[mask].unsqueeze(1).expand(neg.size())
+            # return torch.mean(torch.relu(neg-pos+self.margin))
+            return torch.mean(torch.relu(neg-pos+self.margin))
+
+ ################################
+
+
+    
+    
+    criterion = nn.CrossEntropyLoss()
+    # criterion_xent = nn.CrossEntropyLoss()
+    criterion_xent = nn.MultiMarginLoss(p=2,margin=1)
+    # criterion_xent = HingeLossSim()
     optimizer_model = torch.optim.SGD(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, momentum=args.momentum)
 
 
@@ -271,8 +333,8 @@ def main():
 
         print('\nEpoch: [%d | %d] LR: %f ' % (epoch + 1, args.epochs, state['lr']))
 
-        train_loss, train_acc = train(trainloader, model, criterion_xent,  optimizer_model,  epoch, use_cuda)
-        test_loss, test_acc = test(testloader, model, criterion_xent,  epoch, use_cuda)
+        train_loss, train_acc = train(trainloader, model, criterion_xent, criterion, optimizer_model,  epoch, use_cuda)
+        test_loss, test_acc = test(testloader, model, criterion_xent,criterion,  epoch, use_cuda)
 
         # append logger file
         logger.append([state['lr'], train_loss, test_loss, train_acc, test_acc])
@@ -295,7 +357,7 @@ def main():
     print('Best acc:')
     print(best_acc)
 
-def train(trainloader, model, criterion_xent,  optimizer_model,  epoch, use_cuda):
+def train(trainloader, model, criterion_xent, criterion, optimizer_model,  epoch, use_cuda):
     global state
     # switch to train mode
     model.train()
@@ -321,9 +383,14 @@ def train(trainloader, model, criterion_xent,  optimizer_model,  epoch, use_cuda
         # loss = criterion(outputs, targets)
 
 ########################
-        outputs = model(inputs)
-        loss_xent = criterion_xent(outputs, targets)
-        loss = loss_xent 
+        out_gl = model(inputs)
+        loss_xent = criterion_xent(out_gl, targets)
+        # loss_cross_en = criterion (out_lin, targets)
+        # if epoch < 10:
+        #     loss  = loss_cross_en
+        # else:    
+        #     loss = 80*loss_xent + loss_cross_en
+        loss = loss_xent
         optimizer_model.zero_grad()
         loss.backward()
         optimizer_model.step()
@@ -335,7 +402,7 @@ def train(trainloader, model, criterion_xent,  optimizer_model,  epoch, use_cuda
 
 
         # measure accuracy and record loss
-        prec1, prec5 = accuracy(outputs.data, targets.data, topk=(1, 5))
+        prec1, prec5 = accuracy(out_gl.data, targets.data, topk=(1, 5))
         losses.update(loss.data[0], inputs.size(0))
         top1.update(prec1[0], inputs.size(0))
         top5.update(prec5[0], inputs.size(0))
@@ -365,10 +432,10 @@ def train(trainloader, model, criterion_xent,  optimizer_model,  epoch, use_cuda
     bar.finish()
     return (losses.avg, top1.avg)
 
-def test(testloader, model, criterion_xent,  epoch, use_cuda):
+def test(testloader, model, criterion_xent, criterion,  epoch, use_cuda):
     global best_acc
 
-    batch_time = AverageMeter()
+    batch_time = AverageMeter() 
     data_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
