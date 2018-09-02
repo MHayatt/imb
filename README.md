@@ -1,4 +1,4 @@
-# Learn Imbalance
+## Learn Equi-distant
 
 
 ## Training
